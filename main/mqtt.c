@@ -22,6 +22,7 @@
 #include "esp_event.h"
 #include "mqtt_client.h"
 #include "cJSON.h"
+#include "esp_crt_bundle.h" // Für esp_crt_bundle_attach callback Funktion
 
 #include "mqtt.h"
 
@@ -276,7 +277,7 @@ void mqtt(void *pvParameters)
 				convert_mdns_host(textBuf.host, ip);
 				ESP_LOGI(TAG, "ip=[%s]", ip);
 				char uri[138];
-				sprintf(uri, "mqtt://%s", ip);
+				sprintf(uri, "mqtts://%s", ip);
 				//sprintf(uri,"mqtt://%s", textBuf.host);
 				uint32_t port = strtol( textBuf.port, NULL, 10 );
 				ESP_LOGI(TAG, "uri=[%s] port=%"PRIu32, uri, port);
@@ -286,6 +287,7 @@ void mqtt(void *pvParameters)
 					.broker.address.uri = uri,
 					.broker.address.port = port,
 					.credentials.client_id = textBuf.clientId,
+					.broker.verification.crt_bundle_attach = esp_crt_bundle_attach,
 				};
 				if (strlen(textBuf.username) > 0) {
 					mqtt_cfg.credentials.username = textBuf.username;

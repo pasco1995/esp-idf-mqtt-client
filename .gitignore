@@ -1,0 +1,11 @@
+# Visual Studio Code
+.vscode
+
+# Buildordner
+build
+
+# ESP IDF
+components
+managed_components
+sdkconfig
+dependencies.lock

@@ -1,5 +1,5 @@
 typedef struct {
-	char host[32];
+	char host[128];
 	char port[32];
 	char clientId[32];
 	char username[32];
