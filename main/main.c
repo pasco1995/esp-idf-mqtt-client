@@ -23,6 +23,10 @@
 #include "esp_sntp.h"
 #include "mdns.h"
 #include "lwip/dns.h"
+#include "esp_crt_bundle.h"
+#include "esp_timer.h"
+#include "esp_http_client.h"
+#include "esp_mac.h"
 
 #include "websocket_server.h"
 
@@ -39,6 +43,16 @@ MessageBufferHandle_t xMessageBufferMain;
 MessageBufferHandle_t xMessageBufferMqtt;
 
 const static int client_queue_size = 10;
+
+// InfluxDB Data Queue
+static QueueHandle_t xDataQueue;
+#define DATA_QUEUE_LENGTH 50u
+#define MAX_DATA_LENGTH 128u
+uint8_t ucQueueStorage[ DATA_QUEUE_LENGTH * MAX_DATA_LENGTH ];
+StaticQueue_t xQueueBuffer;
+
+#define BATCH_SIZE 20u
+static char batch[BATCH_SIZE * ( MAX_DATA_LENGTH + 1 )];
 
 /* FreeRTOS event group to signal when we are connected*/
 static EventGroupHandle_t s_wifi_event_group;
@@ -451,6 +465,89 @@ static void time_task(void* pvParameters) {
 	}
 }
 
+static void influx_data_task(void* pvParameters) {
+	const static char* TAG = "influx_data_task";
+	ESP_LOGI(TAG,"starting task");
+	char *mac = (char *)pvParameters;
+	ESP_LOGI(TAG, "MAC : %s", mac);
+
+	time_t now;
+
+	 // Create a queue
+	xDataQueue = xQueueCreateStatic(DATA_QUEUE_LENGTH,
+									MAX_DATA_LENGTH,
+									&(ucQueueStorage[0]),
+									&xQueueBuffer);
+
+	char data[MAX_DATA_LENGTH];
+	for(;;) {
+		time(&now);
+		snprintf(data, sizeof(data), "airSensors,device_mac=%s temperature=70,humidity=35,co=0.48,uptime_us=%llu %lu", mac, esp_timer_get_time(), (uint32_t)now);
+
+		// put data on queue
+		if ( xQueueSend( xDataQueue, ( void * ) &data, ( TickType_t ) 0 ) != pdPASS )
+		{
+			ESP_LOGE(TAG,"failed to put on queue");
+		}
+
+		memset(data, 0, sizeof(data));
+		vTaskDelay(1000/portTICK_PERIOD_MS);
+	}
+}
+
+static void influx_send_task(void* pvParameters) {
+	const static char* TAG = "influx_send_task";
+	ESP_LOGI(TAG,"starting task");
+
+	esp_http_client_config_t cfg = {
+		.url = "https://eu-central-1-1.aws.cloud2.influxdata.com/api/v2/write?bucket=testbucket&precision=s",
+		.method = HTTP_METHOD_POST,
+		.crt_bundle_attach = esp_crt_bundle_attach,
+	};
+
+	esp_http_client_handle_t http_handle = esp_http_client_init(&cfg);
+	esp_http_client_set_header(http_handle, "Authorization", "Token z5q-qvV36-cszwJSm4xU1mG7MQlL-kPo26IdP_x9FeLIqDkFd-tAbl-MZl8lkO-AYSVOADN3h552s6ON8yTw5A==");
+	esp_http_client_set_header(http_handle, "Content-Type", "text/plain; charset=utf-8");
+	esp_http_client_set_header(http_handle, "Accept", "application/json");
+
+	#define DATA_EXPIRATIONCOUNTER 200u
+	uint8_t u8Counter = 0u;
+	for (;;)
+	{
+		vTaskDelay(100/portTICK_PERIOD_MS);
+
+		// data queue empty ?
+		uint8_t u8Num = uxQueueMessagesWaiting(xDataQueue);
+		if ( u8Num == 0) { continue; }
+		u8Counter++;
+
+		// batch size not reached and counter not expired ?
+		if ((u8Num < BATCH_SIZE) && (u8Counter < DATA_EXPIRATIONCOUNTER)) { continue; }
+
+		// get data from queue
+		uint16_t u16DataStrLen = 0u;
+		for (uint8_t u8Idx = 0u; (u8Idx < BATCH_SIZE) && (u8Idx < u8Num); u8Idx++)
+		{
+			// get data
+			char data[MAX_DATA_LENGTH];
+			if( xQueueReceive( xDataQueue, &data, ( TickType_t ) 0 ) != pdPASS)
+			{
+				ESP_LOGE(TAG,"failed to receive from queue");
+				continue;
+			}
+			snprintf(&batch[u16DataStrLen], sizeof(batch) - u16DataStrLen, "%s\n", data);
+			u16DataStrLen += strlen(data) + 1u;
+		}
+		ESP_LOGE(TAG,"Data:\n%s", batch);
+
+		// send data
+		esp_http_client_set_post_field(http_handle, batch, strlen(batch));
+		esp_http_client_perform(http_handle);
+		memset(batch, 0, sizeof(batch));
+		u8Counter = 0u;
+	}
+}
+
 esp_err_t query_mdns_host(const char * host_name, char *ip)
 {
 	ESP_LOGD(__FUNCTION__, "Query A: %s", host_name);
@@ -546,11 +643,19 @@ void app_main() {
 	char cparam0[64];
 	sprintf(cparam0, IPSTR, IP2STR(&ip_info.ip));
 
+	/* Get device MAC address */
+	uint8_t u8BaseMac[6] = {0u};
+	ESP_ERROR_CHECK(esp_efuse_mac_get_default(u8BaseMac));
+	char cparam1[32];
+	snprintf(cparam1, sizeof(cparam1), MACSTR, MAC2STR(u8BaseMac));
+
 	ws_server_start();
 	xTaskCreate(&server_task, "server_task", 1024*2, (void *)cparam0, 9, NULL);
 	xTaskCreate(&server_handle_task, "server_handle_task", 1024*3, NULL, 6, NULL);
 	xTaskCreate(&time_task, "time_task", 1024*2, NULL, 2, NULL);
-	xTaskCreate(mqtt, "mqtt_task", 1024*4, NULL, 2, NULL);
+	//xTaskCreate(mqtt, "mqtt_task", 1024*4, NULL, 2, NULL);
+	xTaskCreate(&influx_data_task, "influx_data_task", 1024*2, (void *)cparam1, 5, NULL);
+	xTaskCreate(&influx_send_task, "influx_send_task", 1024*8, NULL, 5, NULL);
 
 	char cRxBuffer[512];
 
